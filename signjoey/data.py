@@ -6,10 +6,13 @@ import os
 import sys
 import random
 
+import numpy as np
 import torch
 from torchtext import data
 from torchtext.data import Dataset, Iterator
 import socket
+
+from signjoey import data_preprocessing
 from signjoey.dataset import SignTranslationDataset
 from signjoey.vocabulary import (
     build_vocab,
@@ -21,7 +24,7 @@ from signjoey.vocabulary import (
 )
 
 
-def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabulary):
+def load_data(data_cfg: dict, keep_only = None) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabulary):
     """
     Load train, dev and optionally test data as specified in configuration.
     Vocabularies are created from the training set with a limit of `voc_limit`
@@ -39,6 +42,7 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
 
     :param data_cfg: configuration dictionary for data
         ("data" part of configuration file)
+    :param keep_only: If not `None`, only the samples with this name will be kept. A dict with keys 'train', 'dev', and 'test', each containing a list of sample names.
     :return:
         - train_data: training dataset
         - dev_data: development dataset
@@ -47,15 +51,19 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         - txt_vocab: spoken text vocabulary extracted from training data
     """
 
+    if keep_only is None:
+        keep_only = {'train': None, 'dev': None, 'test': None}
+
     data_path = data_cfg.get("data_path", "./data")
 
     if isinstance(data_cfg["train"], list):
+        # If we combine multiple features, we need all paths.
         train_paths = [os.path.join(data_path, x) for x in data_cfg["train"]]
         dev_paths = [os.path.join(data_path, x) for x in data_cfg["dev"]]
         test_paths = [os.path.join(data_path, x) for x in data_cfg["test"]]
         pad_feature_size = sum(data_cfg["feature_size"])
-
     else:
+        # Otherwise, we only need the single path.
         train_paths = os.path.join(data_path, data_cfg["train"])
         dev_paths = os.path.join(data_path, data_cfg["dev"])
         test_paths = os.path.join(data_path, data_cfg["test"])
@@ -65,6 +73,16 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
     txt_lowercase = data_cfg["txt_lowercase"]
     max_sent_length = data_cfg["max_sent_length"]
 
+    preprocessing = data_cfg.get("preprocessing", None)
+    if preprocessing is None:
+        preprocess_features = lambda tokens: tokens
+    else:
+        if preprocessing == "remove_keypoints_and_normalize":
+            preprocess_features = data_preprocessing.remove_keypoints_and_normalize
+        else:
+            print(f'Unknown preprocessing function {preprocessing}, using identity function')
+            preprocess_features = lambda tokens: tokens
+
     def tokenize_text(text):
         if level == "char":
             return list(text)
@@ -72,11 +90,13 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
             return text.split()
 
     def tokenize_features(features):
+        # Creates as many chunks as there are elements in the feature sequence.
         ft_list = torch.split(features, 1, dim=0)
+        # Now, return a list of chunks (as a list of tokens).
         return [ft.squeeze() for ft in ft_list]
 
-    # NOTE (Cihan): The something was necessary to match the function signature.
-    def stack_features(features, something):
+    def stack_features(features, _):
+        # Makes sure that the features are all a single tensor.
         return torch.stack([torch.stack(ft, dim=0) for ft in features], dim=0)
 
     sequence_field = data.RawField()
@@ -90,11 +110,11 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         init_token=None,
         eos_token=None,
         dtype=torch.float32,
-        preprocessing=tokenize_features,
-        tokenize=lambda features: features,  # TODO (Cihan): is this necessary?
+        preprocessing=preprocess_features,  # After tokenizing but before numericalizing.
+        tokenize=tokenize_features,  # Tokenization function.
         batch_first=True,
         include_lengths=True,
-        postprocessing=stack_features,
+        postprocessing=stack_features,  # After numericalizing but before turning into a tensor.
         pad_token=torch.zeros((pad_feature_size,)),
     )
 
@@ -135,6 +155,7 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         fields=(sequence_field, signer_field, sgn_field, gls_field, txt_field),
         filter_pred=lambda x: len(vars(x)["sgn"]) <= max_sent_length
                               and len(vars(x)["txt"]) <= max_sent_length,
+        keep_only=keep_only['train']
     )
 
     gls_max_size = data_cfg.get("gls_voc_limit", sys.maxsize)
@@ -169,10 +190,16 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
             split_ratio=[keep_ratio, 1 - keep_ratio], random_state=random.getstate()
         )
         train_data = keep
+    learning_curve_percentage = data_cfg.get("learning_curve_percentage", 1.0)
+    if not np.isclose(learning_curve_percentage, 1.0):
+        keep, _ = train_data.split(split_ratio=[learning_curve_percentage, 1 - learning_curve_percentage],
+                                   random_state=random.getstate())
+        train_data = keep
 
     dev_data = SignTranslationDataset(
         path=dev_paths,
         fields=(sequence_field, signer_field, sgn_field, gls_field, txt_field_pred),
+        keep_only=keep_only['dev']
     )
     random_dev_subset = data_cfg.get("random_dev_subset", -1)
     if random_dev_subset > -1:
@@ -187,6 +214,7 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
     test_data = SignTranslationDataset(
         path=test_paths,
         fields=(sequence_field, signer_field, sgn_field, gls_field, txt_field_pred),
+        keep_only=keep_only['test']
     )
 
     gls_field.vocab = gls_vocab

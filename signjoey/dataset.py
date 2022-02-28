@@ -27,6 +27,7 @@ class SignTranslationDataset(data.Dataset):
         self,
         path: str,
         fields: Tuple[RawField, RawField, Field, Field, Field],
+        keep_only=None,
         **kwargs
     ):
         """Create a SignTranslationDataset given paths and fields.
@@ -36,6 +37,7 @@ class SignTranslationDataset(data.Dataset):
             exts: A tuple containing the extension to path for each language.
             fields: A tuple containing the fields that will be used for data
                 in each language.
+            keep_only: If not `None`, only the sample with this name will be kept.
             Remaining keyword arguments: Passed to the constructor of
                 data.Dataset.
         """
@@ -56,13 +58,16 @@ class SignTranslationDataset(data.Dataset):
             tmp = load_dataset_file(annotation_file)
             for s in tmp:
                 seq_id = s["name"]
+                if keep_only is not None:
+                    if seq_id not in keep_only:
+                        continue
                 if seq_id in samples:
                     assert samples[seq_id]["name"] == s["name"]
                     assert samples[seq_id]["signer"] == s["signer"]
                     assert samples[seq_id]["gloss"] == s["gloss"]
                     assert samples[seq_id]["text"] == s["text"]
                     samples[seq_id]["sign"] = torch.cat(
-                        [samples[seq_id]["sign"], s["sign"]], axis=1
+                        [samples[seq_id]["sign"].float(), s["sign"].float()], axis=1
                     )
                 else:
                     samples[seq_id] = {
@@ -82,7 +87,7 @@ class SignTranslationDataset(data.Dataset):
                         sample["name"],
                         sample["signer"],
                         # This is for numerical stability
-                        sample["sign"] + 1e-8,
+                        (sample["sign"] + 1e-8).float(),
                         sample["gloss"].strip(),
                         sample["text"].strip(),
                     ],

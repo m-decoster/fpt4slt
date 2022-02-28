@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from itertools import groupby
 from signjoey.initialization import initialize_model
 from signjoey.embeddings import Embeddings, SpatialEmbeddings
-from signjoey.encoders import Encoder, RecurrentEncoder, TransformerEncoder, BERTEncoder, mBARTEncoder
-from signjoey.decoders import Decoder, RecurrentDecoder, TransformerDecoder, mBARTDecoder, BERTDecoder
+from signjoey.encoders import Encoder, RecurrentEncoder, TransformerEncoder, BERTEncoder
+from signjoey.decoders import Decoder, RecurrentDecoder, TransformerDecoder, BERTDecoder
 from signjoey.search import beam_search, greedy
 from signjoey.vocabulary import (
     TextVocabulary,
@@ -407,23 +407,6 @@ def build_model(
             emb_size=sgn_embed.embedding_dim,
             emb_dropout=enc_emb_dropout,
         )
-    elif cfg["encoder"].get("type", "recurrent") == "mBART":
-        assert (
-                cfg["encoder"]["embeddings"]["embedding_dim"]
-                == cfg["encoder"]["hidden_size"]
-        ), "for mBART, emb_size must be hidden_size"
-
-        encoder = mBARTEncoder(
-            **cfg["encoder"],
-            emb_size=sgn_embed.embedding_dim,
-            emb_dropout=enc_emb_dropout,
-        )
-    elif cfg["encoder"].get("type", "recurrent") == "vtnhc":
-        encoder = VTNHCEncoder(
-            **cfg["encoder"],
-            emb_size=sgn_embed.embedding_dim,
-            emb_dropout=enc_emb_dropout,
-        )
     else:
         encoder = RecurrentEncoder(
             **cfg["encoder"],
@@ -458,22 +441,6 @@ def build_model(
             )
         elif cfg["decoder"].get("type", "recurrent") == "BERT":
             decoder = BERTDecoder(
-                **cfg["decoder"],
-                encoder=encoder,
-                vocab_size=len(txt_vocab),
-                emb_size=txt_embed.embedding_dim,
-                emb_dropout=dec_emb_dropout,
-            )
-        elif cfg["decoder"].get("type", "recurrent") == "mBART":
-            decoder = mBARTDecoder(
-                **cfg["decoder"],
-                encoder=encoder,
-                vocab_size=len(txt_vocab),
-                emb_size=txt_embed.embedding_dim,
-                emb_dropout=dec_emb_dropout,
-            )
-        elif cfg["decoder"].get("type", "recurrent") == "GPT2":
-            decoder = GPT2Decoder(
                 **cfg["decoder"],
                 encoder=encoder,
                 vocab_size=len(txt_vocab),

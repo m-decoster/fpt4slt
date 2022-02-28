@@ -8,12 +8,12 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch import Tensor
-from transformers import MBartConfig, MBartModel, BertConfig, BertModel
+from transformers import BertConfig, BertModel
 
 from signjoey.attention import BahdanauAttention, LuongAttention
 from signjoey.encoders import Encoder
 from signjoey.helpers import freeze_params, subsequent_mask
-from signjoey.transformer_layers import PositionalEncoding, TransformerDecoderLayer, mBARTIdentityDecoder, BERTIdentity
+from signjoey.transformer_layers import PositionalEncoding, TransformerDecoderLayer, BERTIdentity
 
 
 # pylint: disable=abstract-method
@@ -566,156 +566,6 @@ class TransformerDecoder(Decoder):
         )
 
 
-class mBARTDecoder(Decoder):
-    """
-    A transformer decoder with N masked layers.
-    Decoder layers are masked so that an attention head cannot see the future.
-    """
-
-    def __init__(
-            self,
-            num_layers: int = 4,
-            num_heads: int = 8,
-            hidden_size: int = 512,
-            ff_size: int = 2048,
-            dropout: float = 0.1,
-            emb_dropout: float = 0.1,
-            vocab_size: int = 1,
-            freeze: bool = False,
-            freeze_pt: str = None,
-            pretrained_name: str = "facebook/mbart-large-cc25",
-            input_layer_init: str = None,
-            **kwargs
-    ):
-        """
-        Initialize a Transformer decoder.
-
-        :param num_layers: number of Transformer layers
-        :param num_heads: number of heads for each layer
-        :param hidden_size: hidden size
-        :param ff_size: position-wise feed-forward size
-        :param dropout: dropout probability (1-keep)
-        :param emb_dropout: dropout probability for embeddings
-        :param vocab_size: size of the output vocabulary
-        :param freeze: set to True keep all decoder parameters fixed
-        :param kwargs:
-        """
-        super(mBARTDecoder, self).__init__()
-
-        self.config = MBartConfig.from_pretrained(pretrained_name)
-        mbart_model = MBartModel.from_pretrained(pretrained_name)
-        self.decoder = mbart_model.decoder
-        # Make sure our configuration file is compatible with the pretrained model
-        assert self.decoder.config.hidden_size == hidden_size
-
-        self._hidden_size = hidden_size
-        self._output_size = vocab_size
-
-        # Only keep given number of layers
-        orig_nr_layers = len(self.decoder.layers)
-        for i in range(orig_nr_layers - 1, num_layers - 1, -1):
-            self.decoder.layers[i] = mBARTIdentityDecoder()
-
-        self.input_layer = nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_layer_init == 'orthogonal':
-            torch.nn.init.orthogonal_(self.input_layer.weight)
-        elif input_layer_init == 'normal':
-            torch.nn.init.normal_(self.input_layer.weight)
-
-        self.encoder_trans = nn.Linear(hidden_size, hidden_size, bias=False)
-
-        # Freeze if requested.
-        print(f'Freezing pre-trained transformer: {freeze_pt}')
-        print(f'Freezing entire decoder: {freeze}')
-        # Default behavior, also for freeze_pt == 'layer_norm_only', is to freeze everything except layer norm
-        for name, p in self.decoder.named_parameters():
-            name = name.lower()
-            if 'layer_norm' not in name and 'embed_positions' not in name:
-                p.requires_grad = False
-        if freeze_pt == 'tune_embs' or freeze_pt == 'finetune_ff':
-            for name, p in self.decoder.named_parameters():
-                name = name.lower()
-                if 'embed_tokens' in name:
-                    p.requires_grad = True
-        if freeze_pt == 'finetune_ff':  # We already froze everything, now unfreeze ff
-            for name, p in self.decoder.named_parameters():
-                name = name.lower()
-                if 'fc' in name:
-                    p.requires_grad = True
-
-        self.layer_norm = nn.LayerNorm(hidden_size, eps=1e-6)
-
-        self.output_layer = nn.Linear(hidden_size, vocab_size, bias=False)
-
-        self.num_layers = num_layers
-
-    def forward(
-            self,
-            trg_embed: Tensor = None,
-            encoder_output: Tensor = None,
-            encoder_hidden: Tensor = None,
-            src_mask: Tensor = None,
-            unroll_steps: int = None,
-            hidden: Tensor = None,
-            trg_mask: Tensor = None,
-            **kwargs
-    ):
-        """
-        Transformer decoder forward pass.
-
-        :param trg_embed: embedded targets
-        :param encoder_output: source representations
-        :param encoder_hidden: unused
-        :param src_mask:
-        :param unroll_steps: unused
-        :param hidden: unused
-        :param trg_mask: to mask out target paddings
-                         Note that a subsequent mask is applied here.
-        :param kwargs:
-        :return:
-        """
-        assert trg_mask is not None, "trg_mask required for Transformer"
-
-        x = self.embed(trg_embed)
-        x = self.input_layer(x)
-        # mBART includes positional encoding, so we don't compute them here.
-
-        # mBART creates a causal mask: transformers.models.mbart.modeling_mbart.MBartDecoder._prepare_decoder_attention_mask.
-        # So we don't compute the causal mask here.
-
-        if src_mask.size(0) != trg_mask.size(0):
-            assert 1 == trg_mask.size(0)
-            # During (greedy) decoding, SignJoey creates a trg_mask of shape (1, 1, 1) - in the first decoding step.
-            # However, mBART expects (batch_size, 1, 1).
-            trg_mask = trg_mask.repeat(src_mask.size(0), 1, 1)
-
-        x = self.layer_norm(x)
-        # Convert masks to format expected by mBART.
-        mask = trg_mask[:, 0, :].type(torch.float32)
-        src_mask = src_mask.squeeze(1).type(torch.float32)
-
-        # Linear transformation of the encoder outputs.
-        encoder_output = self.encoder_trans(encoder_output)
-
-        x = self.decoder(inputs_embeds=x, encoder_hidden_states=encoder_output, encoder_attention_mask=src_mask,
-                         attention_mask=mask, use_cache=False)
-        x = x.last_hidden_state
-
-        output = self.output_layer(x)
-
-        return output, x, None, None
-
-    def embed(self, embed_src):
-        return self.decoder.embed_tokens(embed_src) * self.decoder.embed_scale
-
-    def __repr__(self):
-        return "%s(num_layers=%r, num_heads=%r)" % (
-            self.__class__.__name__,
-            self.num_layers,
-            self.decoder.config.num_attention_heads,
-        )
-
-
 class BERTDecoder(Decoder):
     """
     Transformer Encoder
@@ -732,6 +582,7 @@ class BERTDecoder(Decoder):
             pretrained_name: str = 'bert-base-uncased',
             vocab_size: int = 1,
             input_layer_init: str = None,
+            pretrain: bool = True,
             **kwargs
     ):
         """
@@ -749,8 +600,13 @@ class BERTDecoder(Decoder):
         self.config = BertConfig.from_pretrained(pretrained_name)
         self.config.is_decoder = True
         self.config.add_cross_attention = True
+        if pretrain:
+            print('Using pretrained model')
+            self.bert_model = BertModel.from_pretrained(pretrained_name, config=self.config)
+        else:
+            print('Using BERT from scratch')
+            self.bert_model = BertModel(self.config)
 
-        self.bert_model = BertModel.from_pretrained(pretrained_name, config=self.config)
         self.decoder = self.bert_model.encoder
         # Make sure our configuration file is compatible with the pretrained model
         assert self.decoder.config.hidden_size == hidden_size
@@ -761,30 +617,31 @@ class BERTDecoder(Decoder):
             self.decoder.layer[i] = BERTIdentity()
         self.num_layers = num_layers
 
-        # Freeze if needed. We only freeze the attention and intermediate layers, but keep the
-        #  linear transformations in the "BertOutput" layer.
-        print(f'Freezing pre-trained transformer: {freeze_pt}')
-        print(f'Freezing entire decoder: {freeze}')
-        # Default behavior, also for freeze_pt == 'layer_norm_only', is to freeze everything except layer norm
-        for name, p in self.decoder.named_parameters():
-            name = name.lower()
-            if 'layernorm' not in name:
-                p.requires_grad = False
-        if freeze_pt == 'freeze_ff' or freeze_pt == 'finetune_ff':
+        if pretrain:
+            # Freeze if needed. We only freeze the attention and intermediate layers, but keep the
+            #  linear transformations in the "BertOutput" layer.
+            print(f'Freezing pre-trained transformer: {freeze_pt}')
+            print(f'Freezing entire decoder: {freeze}')
+            # Default behavior, also for freeze_pt == 'layer_norm_only', is to freeze everything except layer norm
             for name, p in self.decoder.named_parameters():
                 name = name.lower()
-                if 'output' in name and 'attention' not in name:
-                    p.requires_grad = True
-        if freeze_pt == 'finetune_ff':
+                if 'layernorm' not in name:
+                    p.requires_grad = False
+            if freeze_pt == 'freeze_ff' or freeze_pt == 'finetune_ff':
+                for name, p in self.decoder.named_parameters():
+                    name = name.lower()
+                    if 'output' in name and 'attention' not in name:
+                        p.requires_grad = True
+            if freeze_pt == 'finetune_ff':
+                for name, p in self.decoder.named_parameters():
+                    name = name.lower()
+                    if 'intermediate' in name:
+                        p.requires_grad = True
+            # Ensure that in any case, we fine tune cross attention, because it is randomly initialized...
             for name, p in self.decoder.named_parameters():
                 name = name.lower()
-                if 'intermediate' in name:
+                if 'crossattention' in name:
                     p.requires_grad = True
-        # Ensure that in any case, we fine tune cross attention, because it is randomly initialized...
-        for name, p in self.decoder.named_parameters():
-            name = name.lower()
-            if 'crossattention' in name:
-                p.requires_grad = True
 
         # Add a linear transformation to our embeddings before passing them to BERT.
         self.input_layer = nn.Linear(hidden_size, hidden_size, bias=False)

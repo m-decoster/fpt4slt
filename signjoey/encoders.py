@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from transformers import BertConfig, BertModel, MBartConfig, MBartModel
+from transformers import BertConfig, BertModel
 
 from signjoey.helpers import freeze_params
-from signjoey.transformer_layers import TransformerEncoderLayer, PositionalEncoding, BERTIdentity, mBARTIdentity
+from signjoey.transformer_layers import TransformerEncoderLayer, PositionalEncoding, BERTIdentity
 
 
 # pylint: disable=abstract-method
@@ -175,6 +175,8 @@ class TransformerEncoder(Encoder):
             dropout: float = 0.1,
             emb_dropout: float = 0.1,
             freeze: bool = False,
+            freeze_like_fpt: bool = False,
+            freeze_type: str = None,
             **kwargs
     ):
         """
@@ -203,6 +205,21 @@ class TransformerEncoder(Encoder):
                 for _ in range(num_layers)
             ]
         )
+
+        print(f'Freezing transformer: {freeze_like_fpt}')
+        if freeze_like_fpt:
+            # Freeze if needed. We only freeze the attention and intermediate layers.
+            print(f'Freezing type: {freeze_type}')
+            # Default behavior, also for freeze_type == 'layer_norm_only', is to freeze everything except layer norm
+            for name, p in self.layers.named_parameters():
+                name = name.lower()
+                if 'layer_norm' not in name:
+                    p.requires_grad = False
+            if freeze_type == 'finetune_ff':
+                for name, p in self.layers.named_parameters():
+                    name = name.lower()
+                    if 'feed_forward' in name:
+                        p.requires_grad = True
 
         self.layer_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self.pe = PositionalEncoding(hidden_size)
@@ -265,6 +282,7 @@ class BERTEncoder(Encoder):
             freeze_pt: str = None,
             pretrained_name: str = 'bert-base-uncased',
             input_layer_init: str = None,
+            pretrain: bool = True,
             **kwargs
     ):
         """
@@ -279,8 +297,13 @@ class BERTEncoder(Encoder):
         """
         super(BERTEncoder, self).__init__()
 
-        self.config = BertConfig.from_pretrained(pretrained_name)
-        self.bert_model = BertModel.from_pretrained(pretrained_name)
+        if pretrain:
+            print('Using pretrained model')
+            self.bert_model = BertModel.from_pretrained(pretrained_name)
+        else:
+            print('Using BERT from scratch')
+            self.config = BertConfig.from_pretrained(pretrained_name)
+            self.bert_model = BertModel(self.config)
         self.encoder = self.bert_model.encoder
         # Make sure our configuration file is compatible with the pretrained model
         assert self.encoder.config.hidden_size == hidden_size
@@ -291,25 +314,27 @@ class BERTEncoder(Encoder):
             self.encoder.layer[i] = BERTIdentity()
         self.num_layers = num_layers
 
-        # Freeze if needed. We only freeze the attention and intermediate layers, but keep the
-        #  linear transformations in the "BertOutput" layer.
-        print(f'Freezing pre-trained transformer: {freeze_pt}')
-        print(f'Freezing entire encoder: {freeze}')
-        # Default behavior, also for freeze_pt == 'layer_norm_only', is to freeze everything except layer norm
-        for name, p in self.encoder.named_parameters():
-            name = name.lower()
-            if 'layernorm' not in name:
-                p.requires_grad = False
-        if freeze_pt == 'freeze_ff' or freeze_pt == 'finetune_ff':
-            for name, p in self.encoder.named_parameters():
-                name = name.lower()
-                if 'output' in name and 'attention' not in name:
-                    p.requires_grad = True
-        if freeze_pt == 'finetune_ff':
-            for name, p in self.encoder.named_parameters():
-                name = name.lower()
-                if 'intermediate' in name:
-                    p.requires_grad = True
+        if pretrain:
+            # Freeze if needed. We only freeze the attention and intermediate layers, but keep the
+            #  linear transformations in the "BertOutput" layer.
+            print(f'Freezing pre-trained transformer: {freeze_pt}')
+            print(f'Freezing entire encoder: {freeze}')
+            # Default behavior, also for freeze_pt == 'layer_norm_only', is to freeze everything except layer norm
+            if freeze_pt != 'rnd2rnd':  # For rnd2rnd we want to train everything
+                for name, p in self.encoder.named_parameters():
+                    name = name.lower()
+                    if 'layernorm' not in name:
+                        p.requires_grad = False
+                if freeze_pt == 'freeze_ff' or freeze_pt == 'finetune_ff':
+                    for name, p in self.encoder.named_parameters():
+                        name = name.lower()
+                        if 'output' in name and 'attention' not in name:
+                            p.requires_grad = True
+                if freeze_pt == 'finetune_ff':
+                    for name, p in self.encoder.named_parameters():
+                        name = name.lower()
+                        if 'intermediate' in name:
+                            p.requires_grad = True
 
         # Add a linear transformation to our embeddings before passing them to BERT.
         self.input_layer = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -355,114 +380,6 @@ class BERTEncoder(Encoder):
         # Because we cut off the head of BERT, we need to further process the mask.
         mask = self.bert_model.get_extended_attention_mask(mask, mask.shape, mask.device)
         x = self.encoder(x, attention_mask=mask)
-
-        return x.last_hidden_state, None
-
-    def __repr__(self):
-        return "%s(num_layers=%r, num_heads=%r)" % (
-            self.__class__.__name__,
-            self.num_layers,
-            self.encoder.config.num_attention_heads,
-        )
-
-
-class mBARTEncoder(Encoder):
-    """
-    Transformer Encoder
-    """
-
-    # pylint: disable=unused-argument
-    def __init__(
-            self,
-            hidden_size: int = 768,
-            num_layers: int = 3,
-            emb_dropout: float = 0.1,
-            freeze: bool = False,
-            freeze_pt: str = None,
-            pretrained_name: str = 'facebook/mbart-large-cc25',
-            input_layer_init: str = None,
-            **kwargs
-    ):
-        """
-        Initializes the Transformer.
-        :param hidden_size: hidden size and size of embeddings
-        :param num_layers: number of layers to keep from BERT
-        :param dropout: dropout probability for Transformer layers
-        :param emb_dropout: Is applied to the input (word embeddings).
-        :param freeze: freeze the parameters of the encoder during training
-        :param pretrained_name: the name to pass to the Huggingface hub for the BERT model weights
-        :param kwargs:
-        """
-        super(mBARTEncoder, self).__init__()
-
-        self.config = MBartConfig.from_pretrained(pretrained_name)
-        self.mbart_model = MBartModel.from_pretrained(pretrained_name)
-        self.encoder = self.mbart_model.encoder
-        # Make sure our configuration file is compatible with the pretrained model
-        assert self.encoder.config.hidden_size == hidden_size
-
-        # Only keep given number of layers
-        orig_nr_layers = len(self.encoder.layers)
-        for i in range(orig_nr_layers - 1, num_layers - 1, -1):
-            self.encoder.layers[i] = mBARTIdentity()
-
-        # Add a linear transformation to our embeddings before passing them to mBART.
-        self.input_layer = nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_layer_init == 'orthogonal':
-            torch.nn.init.orthogonal_(self.input_layer.weight)
-        elif input_layer_init == 'normal':
-            torch.nn.init.normal_(self.input_layer.weight)
-
-        # Freeze if needed. We only freeze the attention and intermediate layers, but keep the
-        #  linear transformations in the "BertOutput" layer.
-        print(f'Freezing pre-trained transformer: {freeze_pt}')
-        print(f'Freezing entire encoder: {freeze}')
-        # Default behavior, also for freeze_pt == 'layer_norm_only', is to freeze everything except layer norm
-        for name, p in self.encoder.named_parameters():
-            name = name.lower()
-            if 'layer_norm' not in name and 'layernorm' not in name and 'embed_positions' not in name:
-                p.requires_grad = False
-        if freeze_pt == 'finetune_ff':  # We already froze everything, now unfreeze ff
-            for name, p in self.encoder.named_parameters():
-                name = name.lower()
-                if 'fc' in name:
-                    p.requires_grad = True
-
-        self.layer_norm = nn.LayerNorm(hidden_size, eps=1e-6)
-
-        self._output_size = hidden_size
-        self.num_layers = num_layers
-
-    # pylint: disable=arguments-differ
-    def forward(
-            self, embed_src: Tensor, src_length: Tensor, mask: Tensor
-    ) -> (Tensor, Tensor):
-        """
-        Pass the input (and mask) through each layer in turn.
-        Applies a Transformer encoder to sequence of embeddings x.
-        The input mini-batch x needs to be sorted by src length.
-        x and mask should have the same dimensions [batch, time, dim].
-
-        :param embed_src: embedded src inputs,
-            shape (batch_size, src_len, embed_size)
-        :param src_length: length of src inputs
-            (counting tokens before padding), shape (batch_size)
-        :param mask: indicates padding areas (zeros where padding), shape
-            (batch_size, src_len, embed_size)
-        :return:
-            - output: hidden states with
-                shape (batch_size, max_length, directions*hidden),
-            - hidden_concat: last hidden state with
-                shape (batch_size, directions*hidden)
-        """
-        x = self.input_layer(embed_src)
-        # mBART includes positional encoding, so we don't compute them here.
-
-        x = self.layer_norm(x)
-        # Convert mask to format expected by mBART.
-        mask = mask.squeeze(dim=1).type(torch.float32)
-        # Use inputs_embeds because we already have embeddings.
-        x = self.encoder(inputs_embeds=x, attention_mask=mask)
 
         return x.last_hidden_state, None
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -291,37 +292,4 @@ class BERTIdentity(nn.Module):
                 output_attentions=False,
                 output_hidden_states=False,
                 return_dict=False, ):
-        return [hidden_states]
-
-
-class mBARTIdentity(nn.Module):
-    """Identity layer for use in mBartModel, which takes 8 inputs in forward instead of 2."""
-
-    def __init__(self):
-        super(mBARTIdentity, self).__init__()
-
-    def forward(self,
-                hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                layer_head_mask: torch.Tensor,
-                output_attentions: bool = False):
-        return [hidden_states]
-
-
-class mBARTIdentityDecoder(nn.Module):
-    """Identity layer for use in mBartModel, which takes 8 inputs in forward instead of 2."""
-
-    def __init__(self):
-        super(mBARTIdentityDecoder, self).__init__()
-
-    def forward(self,
-                hidden_states,
-                attention_mask=None,
-                encoder_hidden_states=None,
-                encoder_attention_mask=None,
-                layer_head_mask=None,
-                cross_attn_layer_head_mask=None,
-                past_key_value=None,
-                output_attentions=None,
-                use_cache=None):
         return [hidden_states]
