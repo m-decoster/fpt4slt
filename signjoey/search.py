@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from signjoey.decoders import Decoder, TransformerDecoder, mBARTDecoder, BERTDecoder
+from signjoey.decoders import Decoder, TransformerDecoder, BERTDecoder
 from signjoey.embeddings import Embeddings
 from signjoey.helpers import tile
 
